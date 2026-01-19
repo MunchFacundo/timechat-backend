@@ -142,6 +142,34 @@ function removeRequest(to, requestId) {
   saveDB();
 }
 
+// ✅ NUEVO: limpiar solicitudes pending entre dos aliases (en ambos sentidos)
+// Esto evita el “duplicate_pending” eterno luego del tacho.
+function clearPendingBetween(a, b) {
+  if (!a || !b) return;
+
+  // a recibió de b
+  if (db.requestsByTo[a]) {
+    const before = db.requestsByTo[a].length;
+    db.requestsByTo[a] = db.requestsByTo[a].filter(
+      (r) => !(r.status === "pending" && r.from === b)
+    );
+    const after = db.requestsByTo[a].length;
+    if (before !== after) console.log("CLEAR_PENDING_DB", b, "->", a, "removed:", before - after);
+  }
+
+  // b recibió de a
+  if (db.requestsByTo[b]) {
+    const before = db.requestsByTo[b].length;
+    db.requestsByTo[b] = db.requestsByTo[b].filter(
+      (r) => !(r.status === "pending" && r.from === a)
+    );
+    const after = db.requestsByTo[b].length;
+    if (before !== after) console.log("CLEAR_PENDING_DB", a, "->", b, "removed:", before - after);
+  }
+
+  saveDB();
+}
+
 // RoomId determinístico para 1-1
 function roomIdFor(a, b) {
   return [a, b].sort().join("_");
@@ -198,7 +226,8 @@ wss.on("connection", (ws) => {
     if (data.type === "request_send") {
       const to = typeof data.to === "string" ? data.to.trim() : "";
       const from = ws.alias;
-      const requestId = typeof data.requestId === "string" ? data.requestId : `${Date.now()}_${Math.random()}`;
+      const requestId =
+        typeof data.requestId === "string" ? data.requestId : `${Date.now()}_${Math.random()}`;
 
       if (!to || !from || to === from) {
         safeSend(ws, { type: "request_sent", ok: false, reason: "bad_request" });
@@ -214,7 +243,7 @@ wss.on("connection", (ws) => {
 
       const req = addRequest(to, from, requestId);
 
-      // Si ya existía una pendiente, respondemos ok “genérico”
+      // Respondemos ok “genérico” (privacidad)
       safeSend(ws, { type: "request_sent", ok: true, requestId });
 
       if (req) {
@@ -248,18 +277,18 @@ wss.on("connection", (ws) => {
       markRequest(to, requestId, "accepted");
       addContactBoth(req.from, req.to);
 
-      // sacar de pendientes (opcional, yo lo saco para que quede limpio)
+      // sacar de pendientes (limpieza)
       removeRequest(to, requestId);
+
+      // ✅ limpiar cualquier pending entre ambos (por si existía algo cruzado)
+      clearPendingBetween(req.from, req.to);
 
       // Notificar a ambos: contacto agregado + abrir chat
       const a = req.from;
       const b = req.to;
 
-      const payloadA = { type: "contact_added", with: b };
-      const payloadB = { type: "contact_added", with: a };
-
-      sendToAlias(a, payloadA);
-      sendToAlias(b, payloadB);
+      sendToAlias(a, { type: "contact_added", with: b });
+      sendToAlias(b, { type: "contact_added", with: a });
 
       // Abrir chat en ambos (room id determinístico)
       const room = roomIdFor(a, b);
@@ -291,6 +320,9 @@ wss.on("connection", (ws) => {
       markRequest(to, requestId, "rejected");
       removeRequest(to, requestId);
 
+      // ✅ limpiar pending entre ambos
+      clearPendingBetween(req.from, req.to);
+
       // Notificamos al emisor (sin revelar nada extra)
       sendToAlias(req.from, { type: "request_rejected", by: to });
 
@@ -307,13 +339,16 @@ wss.on("connection", (ws) => {
       const me = ws.alias;
       if (!other) return;
 
+      // ✅ 1) borrar el contacto de ambos
       removeContactBoth(me, other);
 
-      // notificar a ambos para que lo saquen y no quede chat abierto
+      // ✅ 2) borrar cualquier solicitud pendiente entre ambos (en ambos sentidos)
+      clearPendingBetween(me, other);
+
+      // ✅ 3) notificar a ambos para que lo saquen
       sendToAlias(me, { type: "contact_removed", with: other });
       sendToAlias(other, { type: "contact_removed", with: me });
 
-      // opcional: cerrar sala para ese par (no es obligatorio)
       safeSend(ws, { type: "contact_delete_ok", ok: true });
 
       console.log("DELETE_CONTACT", me, "<->", other);
