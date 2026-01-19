@@ -1,15 +1,57 @@
+const fs = require("fs");
+const path = require("path");
 const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocket.Server({ port: PORT });
 
-// roomId => Set<WebSocket>
-const rooms = new Map();
+// =======================
+// Persistencia simple (JSON)
+// =======================
 
-// alias => Set<WebSocket> (permite múltiples tabs/dispositivos con mismo alias)
+// Si en Render activás "Disk", poné env DATA_DIR=/var/data
+// Si no, usa la carpeta del proyecto (puede resetearse en Free)
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+const DB_FILE = path.join(DATA_DIR, "data.json");
+
+function loadDB() {
+  try {
+    const raw = fs.readFileSync(DB_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    return {
+      requestsByTo: parsed.requestsByTo || {},
+      contactsByAlias: parsed.contactsByAlias || {},
+    };
+  } catch {
+    return { requestsByTo: {}, contactsByAlias: {} };
+  }
+}
+
+function saveDB() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), "utf8");
+  } catch (e) {
+    console.log("⚠️ No pude guardar DB:", e.message);
+  }
+}
+
+const db = loadDB();
+
+// =======================
+// Runtime state
+// =======================
+
+// alias => Set<WebSocket>
 const aliasSockets = new Map();
 
-// helpers
+// rooms: roomId => Set<WebSocket>
+const rooms = new Map();
+
+// =======================
+// Helpers
+// =======================
+
 function safeSend(ws, obj) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(obj));
@@ -36,9 +78,82 @@ function sendToAlias(alias, obj) {
   return true;
 }
 
+function ensureContacts(alias) {
+  if (!db.contactsByAlias[alias]) db.contactsByAlias[alias] = [];
+}
+
+function addContactBoth(a, b) {
+  ensureContacts(a);
+  ensureContacts(b);
+
+  if (!db.contactsByAlias[a].includes(b)) db.contactsByAlias[a].push(b);
+  if (!db.contactsByAlias[b].includes(a)) db.contactsByAlias[b].push(a);
+
+  saveDB();
+}
+
+function removeContactBoth(a, b) {
+  ensureContacts(a);
+  ensureContacts(b);
+
+  db.contactsByAlias[a] = db.contactsByAlias[a].filter((x) => x !== b);
+  db.contactsByAlias[b] = db.contactsByAlias[b].filter((x) => x !== a);
+
+  saveDB();
+}
+
+function getPendingRequestsFor(alias) {
+  return db.requestsByTo[alias] || [];
+}
+
+function addRequest(to, from, requestId) {
+  if (!db.requestsByTo[to]) db.requestsByTo[to] = [];
+
+  // Evitar duplicados por (from) si ya hay pendiente de ese alias
+  const exists = db.requestsByTo[to].some((r) => r.from === from && r.status === "pending");
+  if (exists) return null;
+
+  const req = {
+    id: requestId,
+    to,
+    from,
+    status: "pending", // pending | accepted | rejected
+    createdAt: Date.now(),
+  };
+
+  db.requestsByTo[to].unshift(req);
+  saveDB();
+  return req;
+}
+
+function markRequest(to, requestId, status) {
+  const list = db.requestsByTo[to] || [];
+  const idx = list.findIndex((r) => r.id === requestId);
+  if (idx === -1) return null;
+  list[idx].status = status;
+  list[idx].updatedAt = Date.now();
+  saveDB();
+  return list[idx];
+}
+
+function removeRequest(to, requestId) {
+  const list = db.requestsByTo[to] || [];
+  db.requestsByTo[to] = list.filter((r) => r.id !== requestId);
+  saveDB();
+}
+
+// RoomId determinístico para 1-1
+function roomIdFor(a, b) {
+  return [a, b].sort().join("_");
+}
+
+// =======================
+// WebSocket server
+// =======================
+
 wss.on("connection", (ws) => {
-  ws.currentRoom = null;
   ws.alias = null;
+  ws.currentRoom = null;
 
   ws.on("message", (raw) => {
     let data;
@@ -48,131 +163,186 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // ───────── REGISTER (alias) ─────────
-    // Cliente manda: { type:"register", alias:"abcd_1234" }
+    // =======================
+    // REGISTER
+    // =======================
     if (data.type === "register" && typeof data.alias === "string") {
       const alias = data.alias.trim();
       if (!alias) return;
 
-      // set alias en socket
       ws.alias = alias;
       addAliasSocket(alias, ws);
 
-      console.log("REGISTER", alias, "conns:", aliasSockets.get(alias).size);
+      ensureContacts(alias);
 
-      // ack al cliente
-      safeSend(ws, { type: "registered", alias });
+      // Enviar snapshot al conectar: contactos + requests pendientes
+      const pending = getPendingRequestsFor(alias).filter((r) => r.status === "pending");
 
+      safeSend(ws, {
+        type: "bootstrap",
+        alias,
+        contacts: db.contactsByAlias[alias] || [],
+        pendingRequests: pending,
+      });
+
+      console.log("REGISTER", alias, "tabs:", aliasSockets.get(alias).size);
       return;
     }
 
-    // ───────── JOIN ROOM ─────────
+    // si no registró, ignoramos cosas sensibles
+    if (!ws.alias) return;
+
+    // =======================
+    // REQUEST_SEND
+    // =======================
+    if (data.type === "request_send") {
+      const to = typeof data.to === "string" ? data.to.trim() : "";
+      const from = ws.alias;
+      const requestId = typeof data.requestId === "string" ? data.requestId : `${Date.now()}_${Math.random()}`;
+
+      if (!to || !from || to === from) {
+        safeSend(ws, { type: "request_sent", ok: false, reason: "bad_request" });
+        return;
+      }
+
+      // si ya son contactos, no mandamos solicitud
+      ensureContacts(from);
+      if (db.contactsByAlias[from].includes(to)) {
+        safeSend(ws, { type: "request_sent", ok: false, reason: "already_contacts" });
+        return;
+      }
+
+      const req = addRequest(to, from, requestId);
+
+      // Si ya existía una pendiente, respondemos ok “genérico”
+      safeSend(ws, { type: "request_sent", ok: true, requestId });
+
+      if (req) {
+        // si el receptor está online, se la empujamos
+        sendToAlias(to, { type: "request_received", request: req });
+        console.log("REQUEST", from, "->", to, "stored");
+      } else {
+        console.log("REQUEST", from, "->", to, "duplicate_pending");
+      }
+      return;
+    }
+
+    // =======================
+    // REQUEST_ACCEPT
+    // =======================
+    if (data.type === "request_accept") {
+      const requestId = typeof data.requestId === "string" ? data.requestId : "";
+      if (!requestId) return;
+
+      // el que acepta es ws.alias, por lo tanto "to" = ws.alias
+      const to = ws.alias;
+      const list = db.requestsByTo[to] || [];
+      const req = list.find((r) => r.id === requestId);
+
+      if (!req || req.status !== "pending") {
+        safeSend(ws, { type: "request_accept_ok", ok: false });
+        return;
+      }
+
+      // marcar accepted + crear contacto en ambos
+      markRequest(to, requestId, "accepted");
+      addContactBoth(req.from, req.to);
+
+      // sacar de pendientes (opcional, yo lo saco para que quede limpio)
+      removeRequest(to, requestId);
+
+      // Notificar a ambos: contacto agregado + abrir chat
+      const a = req.from;
+      const b = req.to;
+
+      const payloadA = { type: "contact_added", with: b };
+      const payloadB = { type: "contact_added", with: a };
+
+      sendToAlias(a, payloadA);
+      sendToAlias(b, payloadB);
+
+      // Abrir chat en ambos (room id determinístico)
+      const room = roomIdFor(a, b);
+      sendToAlias(a, { type: "open_chat", with: b, room });
+      sendToAlias(b, { type: "open_chat", with: a, room });
+
+      safeSend(ws, { type: "request_accept_ok", ok: true, with: a });
+
+      console.log("ACCEPT", b, "accepted", a, "room", room);
+      return;
+    }
+
+    // =======================
+    // REQUEST_REJECT
+    // =======================
+    if (data.type === "request_reject") {
+      const requestId = typeof data.requestId === "string" ? data.requestId : "";
+      if (!requestId) return;
+
+      const to = ws.alias;
+      const list = db.requestsByTo[to] || [];
+      const req = list.find((r) => r.id === requestId);
+
+      if (!req || req.status !== "pending") {
+        safeSend(ws, { type: "request_reject_ok", ok: false });
+        return;
+      }
+
+      markRequest(to, requestId, "rejected");
+      removeRequest(to, requestId);
+
+      // Notificamos al emisor (sin revelar nada extra)
+      sendToAlias(req.from, { type: "request_rejected", by: to });
+
+      safeSend(ws, { type: "request_reject_ok", ok: true });
+      console.log("REJECT", to, "rejected", req.from);
+      return;
+    }
+
+    // =======================
+    // CONTACT_DELETE (tacho)
+    // =======================
+    if (data.type === "contact_delete") {
+      const other = typeof data.with === "string" ? data.with.trim() : "";
+      const me = ws.alias;
+      if (!other) return;
+
+      removeContactBoth(me, other);
+
+      // notificar a ambos para que lo saquen y no quede chat abierto
+      sendToAlias(me, { type: "contact_removed", with: other });
+      sendToAlias(other, { type: "contact_removed", with: me });
+
+      // opcional: cerrar sala para ese par (no es obligatorio)
+      safeSend(ws, { type: "contact_delete_ok", ok: true });
+
+      console.log("DELETE_CONTACT", me, "<->", other);
+      return;
+    }
+
+    // =======================
+    // JOIN ROOM
+    // =======================
     if (data.type === "join" && typeof data.room === "string") {
-      // salir de sala anterior
       if (ws.currentRoom && rooms.has(ws.currentRoom)) {
         rooms.get(ws.currentRoom).delete(ws);
       }
-
       ws.currentRoom = data.room;
 
-      if (!rooms.has(data.room)) {
-        rooms.set(data.room, new Set());
-      }
-
+      if (!rooms.has(data.room)) rooms.set(data.room, new Set());
       rooms.get(data.room).add(ws);
 
-      console.log("JOIN", data.room, "clientes:", rooms.get(data.room).size);
+      console.log("JOIN", data.room, "clients:", rooms.get(data.room).size);
       return;
     }
 
-    // ───────── REQUESTS (solicitudes) ─────────
-    // Enviar solicitud:
-    // { type:"request_send", to:"aliasDestino", from:"aliasOrigen", requestId:"..." }
-    if (data.type === "request_send") {
-      const to = typeof data.to === "string" ? data.to.trim() : "";
-      const from = typeof data.from === "string" ? data.from.trim() : ws.alias;
-      const requestId =
-        typeof data.requestId === "string" ? data.requestId : `${Date.now()}_${Math.random()}`;
-
-      if (!to || !from) return;
-
-      const delivered = sendToAlias(to, {
-        type: "request_received",
-        request: {
-          id: requestId,
-          alias: from,
-          timestamp: Date.now(),
-        },
-      });
-
-      // No avisamos si existe o no (tu regla de privacidad),
-      // pero sí podemos devolver un "ok" genérico al emisor:
-      safeSend(ws, {
-        type: "request_sent",
-        to,
-        requestId,
-        delivered: !!delivered, // si querés ocultarlo, podés borrar este campo en frontend
-      });
-
-      console.log("REQUEST", from, "->", to, delivered ? "DELIVERED" : "OFFLINE");
-      return;
-    }
-
-    // Aceptar solicitud:
-    // { type:"request_accept", to:"aliasOrigen", from:"miAlias", requestId:"..." }
-    if (data.type === "request_accept") {
-      const to = typeof data.to === "string" ? data.to.trim() : "";
-      const from = typeof data.from === "string" ? data.from.trim() : ws.alias;
-      const requestId = typeof data.requestId === "string" ? data.requestId : "";
-
-      if (!to || !from) return;
-
-      sendToAlias(to, {
-        type: "request_accepted",
-        by: from,
-        requestId,
-      });
-
-      safeSend(ws, { type: "request_accept_ok", requestId });
-
-      console.log("ACCEPT", from, "accepted", to);
-      return;
-    }
-
-    // Rechazar solicitud:
-    // { type:"request_reject", to:"aliasOrigen", from:"miAlias", requestId:"..." }
-    if (data.type === "request_reject") {
-      const to = typeof data.to === "string" ? data.to.trim() : "";
-      const from = typeof data.from === "string" ? data.from.trim() : ws.alias;
-      const requestId = typeof data.requestId === "string" ? data.requestId : "";
-
-      if (!to || !from) return;
-
-      sendToAlias(to, {
-        type: "request_rejected",
-        by: from,
-        requestId,
-      });
-
-      safeSend(ws, { type: "request_reject_ok", requestId });
-
-      console.log("REJECT", from, "rejected", to);
-      return;
-    }
-
-    // ───── MESSAGE / TYPING / LEFT (ROOM) ─────
-    if (
-      (data.type === "message" || data.type === "typing" || data.type === "left") &&
-      ws.currentRoom
-    ) {
+    // =======================
+    // MESSAGE / TYPING (solo en sala)
+    // =======================
+    if ((data.type === "message" || data.type === "typing") && ws.currentRoom) {
       const room = rooms.get(ws.currentRoom);
       if (!room) return;
 
-      if (data.type === "message") {
-        console.log("MSG", ws.currentRoom, data.payload?.from, data.payload?.body);
-      }
-
-      // reenviar a todos MENOS al emisor
       for (const client of room) {
         if (client !== ws && client.readyState === WebSocket.OPEN) {
           client.send(JSON.stringify(data));
@@ -182,21 +352,16 @@ wss.on("connection", (ws) => {
     }
   });
 
-  // ───────── CLOSE ─────────
   ws.on("close", () => {
-    // quitar de alias registry
     removeAliasSocket(ws.alias, ws);
 
-    // quitar de room
     if (ws.currentRoom && rooms.has(ws.currentRoom)) {
       const room = rooms.get(ws.currentRoom);
       room.delete(ws);
-
-      if (room.size === 0) {
-        rooms.delete(ws.currentRoom);
-      }
+      if (room.size === 0) rooms.delete(ws.currentRoom);
     }
   });
 });
 
 console.log(`✅ Timechat WS backend corriendo en ws://0.0.0.0:${PORT}`);
+console.log(`📦 DB file: ${DB_FILE}`);
