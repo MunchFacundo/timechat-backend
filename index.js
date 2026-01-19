@@ -142,8 +142,7 @@ function removeRequest(to, requestId) {
   saveDB();
 }
 
-// ✅ NUEVO: limpiar solicitudes pending entre dos aliases (en ambos sentidos)
-// Esto evita el “duplicate_pending” eterno luego del tacho.
+// ✅ Limpiar solicitudes pending entre dos aliases (en ambos sentidos)
 function clearPendingBetween(a, b) {
   if (!a || !b) return;
 
@@ -168,6 +167,24 @@ function clearPendingBetween(a, b) {
   }
 
   saveDB();
+}
+
+// ✅ NUEVO: borrar por id (por seguridad) en cualquier buzón
+function removeRequestEverywhere(requestId) {
+  if (!requestId) return;
+  let removed = 0;
+
+  for (const to of Object.keys(db.requestsByTo)) {
+    const before = db.requestsByTo[to]?.length || 0;
+    db.requestsByTo[to] = (db.requestsByTo[to] || []).filter((r) => r.id !== requestId);
+    const after = db.requestsByTo[to]?.length || 0;
+    removed += before - after;
+  }
+
+  if (removed > 0) {
+    console.log("REMOVE_REQUEST_EVERYWHERE", requestId, "removed:", removed);
+    saveDB();
+  }
 }
 
 // RoomId determinístico para 1-1
@@ -212,6 +229,14 @@ wss.on("connection", (ws) => {
         contacts: db.contactsByAlias[alias] || [],
         pendingRequests: pending,
       });
+
+      // ✅ NUEVO: re-empujar pendientes como eventos (por si el cliente no refrescó bien)
+      for (const r of pending) {
+        safeSend(ws, { type: "request_received", request: r });
+      }
+      if (pending.length > 0) {
+        console.log("RE-PUSH pending to", alias, pending.length);
+      }
 
       console.log("REGISTER", alias, "tabs:", aliasSockets.get(alias).size);
       return;
@@ -263,8 +288,7 @@ wss.on("connection", (ws) => {
       const requestId = typeof data.requestId === "string" ? data.requestId : "";
       if (!requestId) return;
 
-      // el que acepta es ws.alias, por lo tanto "to" = ws.alias
-      const to = ws.alias;
+      const to = ws.alias; // el que acepta
       const list = db.requestsByTo[to] || [];
       const req = list.find((r) => r.id === requestId);
 
@@ -277,8 +301,8 @@ wss.on("connection", (ws) => {
       markRequest(to, requestId, "accepted");
       addContactBoth(req.from, req.to);
 
-      // sacar de pendientes (limpieza)
-      removeRequest(to, requestId);
+      // ✅ limpiar: quitar esta request por id en TODOS lados
+      removeRequestEverywhere(requestId);
 
       // ✅ limpiar cualquier pending entre ambos (por si existía algo cruzado)
       clearPendingBetween(req.from, req.to);
@@ -290,7 +314,6 @@ wss.on("connection", (ws) => {
       sendToAlias(a, { type: "contact_added", with: b });
       sendToAlias(b, { type: "contact_added", with: a });
 
-      // Abrir chat en ambos (room id determinístico)
       const room = roomIdFor(a, b);
       sendToAlias(a, { type: "open_chat", with: b, room });
       sendToAlias(b, { type: "open_chat", with: a, room });
@@ -318,12 +341,13 @@ wss.on("connection", (ws) => {
       }
 
       markRequest(to, requestId, "rejected");
-      removeRequest(to, requestId);
+
+      // ✅ limpiar: quitar esta request por id en TODOS lados
+      removeRequestEverywhere(requestId);
 
       // ✅ limpiar pending entre ambos
       clearPendingBetween(req.from, req.to);
 
-      // Notificamos al emisor (sin revelar nada extra)
       sendToAlias(req.from, { type: "request_rejected", by: to });
 
       safeSend(ws, { type: "request_reject_ok", ok: true });
@@ -339,13 +363,11 @@ wss.on("connection", (ws) => {
       const me = ws.alias;
       if (!other) return;
 
-      // ✅ 1) borrar el contacto de ambos
       removeContactBoth(me, other);
 
-      // ✅ 2) borrar cualquier solicitud pendiente entre ambos (en ambos sentidos)
+      // ✅ borrar cualquier solicitud pendiente entre ambos
       clearPendingBetween(me, other);
 
-      // ✅ 3) notificar a ambos para que lo saquen
       sendToAlias(me, { type: "contact_removed", with: other });
       sendToAlias(other, { type: "contact_removed", with: me });
 
@@ -400,3 +422,4 @@ wss.on("connection", (ws) => {
 
 console.log(`✅ Timechat WS backend corriendo en ws://0.0.0.0:${PORT}`);
 console.log(`📦 DB file: ${DB_FILE}`);
+
